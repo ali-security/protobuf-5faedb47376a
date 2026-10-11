@@ -1,0 +1,6 @@
+# The Windows release wheels are built from a core.autocrlf=true checkout, which
+# is what gives their .py files CRLF line endings (descriptor_database.py is
+# 6996 bytes / 177 CRLF in the public cp3x-win32/win_amd64 wheels). That
+# conversion must NOT reach the test goldens: test_util.GoldenFile opens
+# src/google/protobuf/testdata/** in binary mode and compares byte for byte.
+src/google/protobuf/testdata/** -text

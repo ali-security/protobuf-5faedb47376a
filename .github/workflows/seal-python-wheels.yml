@@ -1,0 +1,868 @@
+# Reproduces the 20 public PyPI artifacts of protobuf 3.15.8 and runs the
+# project's own Python test suite (python/tox.ini -> py*-python).
+#
+# Upstream built these on Kokoro; the in-tree scripts are the spec:
+#   kokoro/release/python/{linux,macos}/config.sh  (multibuild, bdist_wheel_cmd)
+#   kokoro/release/python/windows/build_single_artifact.bat
+#   python/release.sh                              (sdist + pure wheel)
+# Every platform wheel is built with kokoro's own command, from python/:
+#     python setup.py bdist_wheel --cpp_implementation --compile_static_extension
+# libprotobuf is linked statically, so no wheel carries protobuf.libs/ .dylibs/
+# or a DLL.
+#
+# Metadata bands. Each public reference's dist-info/WHEEL names a Generator and
+# its METADATA was written by a particular setuptools; both were bisected
+# locally against the references (python:3.x images + this time machine):
+#   * manylinux1 x6, macOS x6, win cp36-win32  -> bdist_wheel (0.36.2),
+#       Metadata-Version 2.1 + Maintainer:  (any setuptools 38.7.0..54.2.0)
+#   * win cp35 (both arches)                   -> bdist_wheel (0.30.0),
+#       Metadata-Version 2.0 + Author: + Description-Content-Type: UNKNOWN,
+#       DESCRIPTION.rst + metadata.json        (setuptools <= 38.5.2; 38.5.1 is
+#       the OTHER_TEST_DEP kokoro/release/python/windows/build_artifacts.bat pins)
+#   * win cp36-win_amd64                       -> bdist_wheel (0.30.0),
+#       Metadata-Version 2.0 + Maintainer:     (setuptools >= 38.7.0)
+#   * win cp37 (both arches)                   -> bdist_wheel (0.31.1)
+#   * pure wheel + sdist                       -> bdist_wheel (0.34.2),
+#       sdist PKG-INFO Metadata-Version 1.2    (setuptools 45.2.0 = Ubuntu 20.04)
+# Where a band admits a range, each leg takes the newest setuptools its Python
+# can install from the time machine: 54.2.0 (py>=3.6), 50.3.2 (py3.5),
+# 44.1.1 (py2.7).
+
+name: seal-python-wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: >-
+          Optional test selector. Empty (the default) runs the project's whole
+          suite via `python setup.py -q test -q`. A non-empty value narrows the
+          run to `python setup.py -q test -q --test-suite=<value>` (setup.py
+          declares test_suite='google.protobuf.internal'; --test-suite/-s is the
+          setuptools test command's own selector), e.g.
+          google.protobuf.internal.descriptor_test
+        required: false
+        default: ''
+
+env:
+  # Registry time machine: resolve the packages that existed at 3.15.8's release.
+  PIP_INDEX_URL: "https://:2021-04-08T17:21:56.000000Z@time-machines-pypi.sealsecurity.io/"
+  PIP_TRUSTED_HOST: "time-machines-pypi.sealsecurity.io"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 6 manylinux1_x86_64 wheels: cp27-cp27mu, cp35-cp35m, cp36-cp36m, cp37-cp37m,
+  # cp38-cp38, cp39-cp39. Built inside quay.io/pypa/manylinux1_x86_64 via
+  # `docker run` and NOT with a job-level `container:`, so the JS actions keep a
+  # modern glibc.
+  # ---------------------------------------------------------------------------
+  manylinux1:
+    name: manylinux1 ${{ matrix.pytag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # cp27-cp27mu (NOT cp27m) is the interpreter the public wheel was built with.
+          - pytag: cp27-cp27mu
+            setuptools: setuptools==44.1.1
+          - pytag: cp35-cp35m
+            setuptools: setuptools==50.3.2
+          - pytag: cp36-cp36m
+            setuptools: setuptools==54.2.0
+          - pytag: cp37-cp37m
+            setuptools: setuptools==54.2.0
+          - pytag: cp38-cp38
+            setuptools: setuptools==54.2.0
+          - pytag: cp39-cp39
+            setuptools: setuptools==54.2.0
+    env:
+      # Pinned tag, verified to still ship all six interpreters
+      # (/opt/python/{cp27-cp27mu,cp35-cp35m,cp36-cp36m,cp37-cp37m,cp38-cp38,cp39-cp39}).
+      # `latest` is a 2024 rebuild and must not be assumed to keep them.
+      # 2021-08-21-78eb32a was pulled from quay; this is the nearest surviving
+      # tag (still active on quay), same devtoolset-2 gcc 4.8.2.
+      MANYLINUX_IMAGE: quay.io/pypa/manylinux1_x86_64:2021-08-01-f71d505
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # configure.ac has AC_CONFIG_SUBDIRS([third_party/googletest]), so the
+          # autotools build needs the submodule checked out.
+          submodules: recursive
+
+      - name: Pull the pinned manylinux1 image
+        run: docker pull "$MANYLINUX_IMAGE"
+
+      - name: Build protoc, the wheel, and run the test suite
+        run: |
+          docker run --rm -i \
+            -e TEST_FILTER="${{ inputs.test-filter }}" \
+            -v "$PWD":/work -w /work \
+            "$MANYLINUX_IMAGE" \
+            bash -s -- "${{ matrix.pytag }}" "${{ matrix.setuptools }}" <<'CONTAINER'
+          set -ex
+          export PIP_INDEX_URL='https://:2021-04-08T17:21:56.000000Z@time-machines-pypi.sealsecurity.io/'
+          export PIP_TRUSTED_HOST=time-machines-pypi.sealsecurity.io
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+          PYTAG="$1"
+          SETUPTOOLS="$2"
+          PYBIN="/opt/python/${PYTAG}/bin"
+          PY="${PYBIN}/python"
+          "$PY" --version
+
+          # --- protoc + static, -fPIC libprotobuf (kokoro linux/config.sh pre_build) ---
+          # configure.ac's AX_CXX_COMPILE_STDCXX([11]) adds -std=c++11 itself.
+          ./autogen.sh
+          CXXFLAGS="-fPIC -g -O2" ./configure
+          # -j2, not -j$(nproc): at -j$(nproc) the Linux OOM killer took out the
+          # whole `docker run` while compiling google/protobuf/compiler/csharp/*
+          # (one old g++ per core on protobuf's compiler sources with -g exceeds
+          # the 4-core ubuntu-latest runner's RAM), and the runner then died with
+          # "Killed docker run" / exit code 143.
+          make -j2
+
+          # kokoro/release/python/linux/build_artifacts.sh seds an extra
+          # `extra_compile_args.append("-std=c++11")` into python/setup.py. At
+          # v3.15.8 setup.py already appends -std=c++11 on non-Windows, so the
+          # flag is present and no source edit is needed.
+
+          cd /work/python
+          "$PY" -m pip install "$SETUPTOOLS" "wheel==0.36.2" "six==1.15.0"
+
+          # --- the release wheel (kokoro linux/config.sh bdist_wheel_cmd) ---
+          # multibuild's configure_build.sh (as of 3.15.8's release) exports
+          # CFLAGS/CXXFLAGS="-Wl,-strip-all" for every Linux build; distutils puts
+          # CFLAGS on the extension's link line, which is why the public
+          # manylinux1 .so files carry no .symtab/.debug_*. Verified locally on
+          # cp39: with these flags both .so are byte-identical to the reference.
+          # (libprotobuf above keeps configure's explicit CXXFLAGS, as on kokoro.)
+          export CFLAGS="-Wl,-strip-all" CXXFLAGS="-Wl,-strip-all"
+          "$PY" setup.py bdist_wheel --cpp_implementation --compile_static_extension
+          unset CFLAGS CXXFLAGS
+          ls -l dist
+
+          # --- auditwheel repair (multibuild's repair_wheelhouse) ---
+          # The public manylinux1 wheels have a CRLF RECORD and auditwheel's
+          # member order with no bundled libs: auditwheel's rewrite signature.
+          # 3.3.1 is the newest auditwheel release before 3.15.8 shipped (4.x
+          # stamps the PEP 600 alias manylinux_2_5_x86_64 into the filename; the
+          # normalize step below strips it if it ever shows up anyway).
+          /opt/python/cp39-cp39/bin/pip install "auditwheel==3.3.1"
+          /opt/python/cp39-cp39/bin/python -m auditwheel repair \
+            --plat manylinux1_x86_64 -w /work/wheelhouse dist/*.whl
+          ls -l /work/wheelhouse
+
+          # --- kokoro linux/config.sh run_tests: the extension imports from the wheel ---
+          "$PY" -m pip install --no-deps --target /tmp/wheeltest /work/wheelhouse/*.whl
+          (cd /tmp && PYTHONPATH=/tmp/wheeltest "$PY" -c "from google.protobuf.pyext import _message; print(_message.__file__)")
+
+          # --- python/tox.ini py*-python env, command for command ---
+          export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+          "$PY" setup.py -q build_py
+          "$PY" setup.py -q build
+          if [ -n "${TEST_FILTER}" ]; then
+            "$PY" setup.py -q test -q --test-suite="${TEST_FILTER}"
+          else
+            "$PY" setup.py -q test -q
+          fi
+          # test_conformance runs `make test_python` in ../conformance, which
+          # calls a bare `python` and execs conformance_python.py
+          # (#!/usr/bin/env python). tox puts the env's interpreter first on PATH
+          # and installs python/ with usedevelop=true; PATH + PYTHONPATH do the same.
+          # The C++ conformance-test-runner is linked first with libtool's
+          # -static (static libprotobuf, no libprotobuf.so): devtoolset-2 embeds
+          # libstdc++'s std::call_once helpers into every DSO, so a runner linked
+          # against libprotobuf.so segfaults in FieldDescriptor::type()'s
+          # call_once after 306 tests (gdb: __once_call_impl via
+          # Reflection::HasBit). That is a harness/toolchain crash, not a
+          # protobuf test result; the static link changes nothing in the wheel.
+          make -C /work/conformance conformance-test-runner LDFLAGS=-static
+          PATH="${PYBIN}:$PATH" PYTHONPATH=/work/python "$PY" setup.py -q test_conformance
+
+          # the container runs as root; let the runner user read the outputs
+          chmod -R a+rwX /work/wheelhouse /work/python/dist
+          CONTAINER
+
+      - name: Normalize the platform tag to plain manylinux1_x86_64
+        run: |
+          python3 - <<'PY'
+          import base64, glob, hashlib, os, zipfile
+
+          ALIAS = "manylinux_2_5_x86_64.manylinux1_x86_64"
+
+          def b64(d):
+              return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+
+          for whl in sorted(glob.glob("wheelhouse/*.whl")):
+              base = os.path.basename(whl)
+              if ALIAS not in base:
+                  print("already plain manylinux1_x86_64:", base)
+                  continue
+              zin = zipfile.ZipFile(whl)
+              names = zin.namelist()
+              data = {n: zin.read(n) for n in names}
+              infos = {n: zin.getinfo(n) for n in names}
+              zin.close()
+              wheel_md = next(n for n in names if n.endswith(".dist-info/WHEEL"))
+              record = next(n for n in names if n.endswith(".dist-info/RECORD"))
+              data[wheel_md] = b"\n".join(
+                  line for line in data[wheel_md].split(b"\n")
+                  if not (line.startswith(b"Tag:") and b"manylinux_2_5_x86_64" in line)
+              )
+              entry = "%s,sha256=%s,%d" % (
+                  wheel_md, b64(hashlib.sha256(data[wheel_md]).digest()), len(data[wheel_md])
+              )
+              data[record] = b"\r\n".join(
+                  entry.encode() if line.startswith(wheel_md.encode() + b",") else line
+                  for line in data[record].split(b"\r\n")
+              )
+              out = os.path.join(os.path.dirname(whl), base.replace(ALIAS, "manylinux1_x86_64"))
+              with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+                  for n in names:
+                      src = infos[n]
+                      zi = zipfile.ZipInfo(n, date_time=src.date_time)
+                      zi.compress_type = src.compress_type
+                      zi.external_attr = src.external_attr
+                      zi.create_system = src.create_system
+                      zout.writestr(zi, data[n])
+              os.remove(whl)
+              print("rewrote", base, "->", os.path.basename(out))
+          PY
+          ls -l wheelhouse
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: pypi-manylinux1-${{ matrix.pytag }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 6 macOS wheels. actions/setup-python interpreters carry a deployment target
+  # that lands in the Mach-O and breaks parity, so each leg installs the official
+  # python.org macosx10.9 installer the way multibuild did (MB_PYTHON_OSX_VER=10.9).
+  # cp35 is the macosx_10_9_intel wheel (kokoro used MB_PYTHON_OSX_VER=10.6 for
+  # it, the i386+x86_64 python.org build); see the cp35 notes below.
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macos ${{ matrix.tag }} ${{ matrix.plat }}
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: cp27
+            pkgver: "2.7.18"
+            pyver: "2.7"
+            pkg: python-2.7.18-macosx10.9.pkg
+            pybin: /Library/Frameworks/Python.framework/Versions/2.7/bin/python2.7
+            plat: macosx-10.9-x86_64
+            setuptools: setuptools==44.1.1
+            bootstrap_pip: "yes"
+          - tag: cp35
+            pkgver: "3.5.4"
+            pyver: "3.5"
+            pkg: ""
+            pybin: /Library/Frameworks/Python.framework/Versions/3.5/bin/python3.5
+            # macosx-10.9-intel is the published tag (i386+x86_64 FAT), but modern
+            # clang cannot emit i386 at all and the reference wheel's own i386
+            # slices are 4132-byte empty stubs (both _message and
+            # _api_implementation), so only the x86_64 slices (3079588 / 9192
+            # bytes) hold compiled code. This leg therefore builds an honest
+            # x86_64 extension and keeps the published --plat-name.
+            plat: macosx-10.9-intel
+            setuptools: setuptools==50.3.2
+            bootstrap_pip: "no"
+            build_from_source: "yes"
+          - tag: cp36
+            pkgver: "3.6.8"
+            pyver: "3.6"
+            pkg: python-3.6.8-macosx10.9.pkg
+            pybin: /Library/Frameworks/Python.framework/Versions/3.6/bin/python3.6
+            plat: macosx-10.9-x86_64
+            setuptools: setuptools==54.2.0
+            bootstrap_pip: "no"
+          - tag: cp37
+            pkgver: "3.7.9"
+            pyver: "3.7"
+            pkg: python-3.7.9-macosx10.9.pkg
+            pybin: /Library/Frameworks/Python.framework/Versions/3.7/bin/python3.7
+            plat: macosx-10.9-x86_64
+            setuptools: setuptools==54.2.0
+            bootstrap_pip: "no"
+          - tag: cp38
+            pkgver: "3.8.10"
+            pyver: "3.8"
+            pkg: python-3.8.10-macosx10.9.pkg
+            pybin: /Library/Frameworks/Python.framework/Versions/3.8/bin/python3.8
+            plat: macosx-10.9-x86_64
+            setuptools: setuptools==54.2.0
+            bootstrap_pip: "no"
+          - tag: cp39
+            pkgver: "3.9.13"
+            pyver: "3.9"
+            pkg: python-3.9.13-macosx10.9.pkg
+            pybin: /Library/Frameworks/Python.framework/Versions/3.9/bin/python3.9
+            plat: macosx-10.9-x86_64
+            setuptools: setuptools==54.2.0
+            bootstrap_pip: "no"
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.9"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # cp35 builds its interpreter from source; every other leg installs the
+      # python.org pkg. python.org only ever shipped 3.5.4 for macOS as the 10.6
+      # i386+x86_64 fat build, and NEITHER slice runs on macOS 15: both were
+      # linked against a 10.6 CoreFoundation, so dyld aborts with "dyld cache
+      # '(null)' not loaded" / "Library not loaded: .../CoreFoundation" (also
+      # under `arch -x86_64`). Building 3.5.4 with a 10.9 deployment target links
+      # it against the current SDK, so it runs.
+      - name: Build CPython ${{ matrix.pkgver }} from source (cp35)
+        if: matrix.build_from_source == 'yes'
+        run: |
+          set -ex
+          brew install --quiet zlib
+          # 3.5.4's configure does not look in Homebrew's keg-only zlib prefix, so
+          # point it there explicitly: without a working zlib module `make install`
+          # cannot unpack the bundled setuptools wheel ("zlib not available").
+          ZP="$(brew --prefix zlib)"
+          export CPPFLAGS="-I$ZP/include"
+          export LDFLAGS="-L$ZP/lib"
+          export PKG_CONFIG_PATH="$ZP/lib/pkgconfig"
+          curl -sSfLO "https://www.python.org/ftp/python/${{ matrix.pkgver }}/Python-${{ matrix.pkgver }}.tgz"
+          tar xzf "Python-${{ matrix.pkgver }}.tgz"
+          cd "Python-${{ matrix.pkgver }}"
+          # 3.5.4 predates the current clang's stricter defaults; these two flags
+          # are what let it compile at all on a modern toolchain.
+          export MACOSX_DEPLOYMENT_TARGET=10.9
+          export CFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion"
+          ./configure --enable-framework --with-ensurepip=install \
+            --enable-optimizations=no >/tmp/py-configure.log 2>&1 || {
+              tail -40 /tmp/py-configure.log; exit 1; }
+          make -j"$(sysctl -n hw.ncpu)" >/tmp/py-make.log 2>&1 || {
+              tail -60 /tmp/py-make.log; exit 1; }
+          # -E: the ensurepip step of `make install` runs the freshly built python,
+          # which needs the zlib flags above still in the environment; plain sudo
+          # would drop them and fail with "zlib not available".
+          sudo -E make frameworkinstall >/tmp/py-install.log 2>&1 || {
+              tail -40 /tmp/py-install.log; exit 1; }
+          # frameworkinstall runs as root, so the framework (and its site-packages)
+          # ends up root-owned and the later non-root `pip install` dies with
+          # PermissionError moving bin/easy_install-3.5. Hand it to the runner user.
+          sudo chown -R "$(id -u):$(id -g)" /Library/Frameworks/Python.framework/Versions/${{ matrix.pyver }}
+          "${{ matrix.pybin }}" --version
+          "${{ matrix.pybin }}" -c "import sysconfig; print(sysconfig.get_platform(), sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET'))"
+
+      - name: Install python.org CPython ${{ matrix.pkgver }}
+        if: matrix.build_from_source != 'yes'
+        run: |
+          set -ex
+          curl -sSfLO "https://www.python.org/ftp/python/${{ matrix.pkgver }}/${{ matrix.pkg }}"
+          sudo installer -pkg "${{ matrix.pkg }}" -target /
+          rm -f "${{ matrix.pkg }}"
+          "${{ matrix.pybin }}" --version
+          "${{ matrix.pybin }}" -c "import sysconfig; print(sysconfig.get_platform(), sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET'))"
+
+      - name: Stage the build dependencies
+        run: |
+          set -ex
+          PY="${{ matrix.pybin }}"
+          if [ "${{ matrix.bootstrap_pip }}" = "yes" ]; then
+            # pip 20.3.4 is the last release python 2.7 can run (published
+            # 2021-01-23, so the time machine serves it).
+            "$PY" -m pip install "pip==20.3.4"
+          fi
+          "$PY" -m pip install "${{ matrix.setuptools }}" "wheel==0.36.2" "six==1.15.0"
+          # tox puts the env's interpreter first on PATH as `python`; the
+          # conformance Makefile and conformance_python.py's shebang need that.
+          mkdir -p "$RUNNER_TEMP/pyshim"
+          ln -sf "$PY" "$RUNNER_TEMP/pyshim/python"
+          "$RUNNER_TEMP/pyshim/python" --version
+
+      - name: Build protoc and static libprotobuf (kokoro macos/config.sh pre_build)
+        run: |
+          set -ex
+          brew install --quiet autoconf automake libtool
+          ./autogen.sh
+          CXXFLAGS="-std=c++14 -fPIC -g -O2" ./configure
+          make -j"$(sysctl -n hw.ncpu)"
+          ls -l src/.libs/libprotobuf.a src/.libs/libprotobuf-lite.a src/protoc
+
+      - name: Build the ${{ matrix.plat }} wheel
+        run: |
+          set -ex
+          cd python
+          export _PYTHON_HOST_PLATFORM="${{ matrix.plat }}"
+          export ARCHFLAGS="-arch x86_64"
+          "${{ matrix.pybin }}" setup.py bdist_wheel \
+            --cpp_implementation --compile_static_extension \
+            --plat-name "${{ matrix.plat }}"
+          ls -l dist
+          for so in build/lib*/google/protobuf/pyext/_message*.so; do file "$so"; done
+
+      - name: Import the extension from the built wheel (kokoro run_tests)
+        run: |
+          set -ex
+          PY="${{ matrix.pybin }}"
+          # Unzip rather than pip-install: the source-built x86_64-only cp35
+          # interpreter rejects the published `intel` tag. site.addsitedir (not
+          # PYTHONPATH) so py2.7 processes the wheel's nspkg.pth, which is what
+          # makes the `google` namespace importable there.
+          unzip -q -o python/dist/*.whl -d "$RUNNER_TEMP/wheeltest"
+          cd "$RUNNER_TEMP"
+          "$PY" -c "import site; site.addsitedir('$RUNNER_TEMP/wheeltest'); from google.protobuf.pyext import _message; print(_message.__file__)"
+
+      - name: Run the project's test suite (python/tox.ini py*-python)
+        env:
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+        run: |
+          set -ex
+          cd python
+          PY="${{ matrix.pybin }}"
+          "$PY" setup.py -q build_py
+          "$PY" setup.py -q build
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            "$PY" setup.py -q test -q --test-suite="${{ inputs.test-filter }}"
+          else
+            "$PY" setup.py -q test -q
+          fi
+          PATH="$RUNNER_TEMP/pyshim:$PATH" PYTHONPATH="$GITHUB_WORKSPACE/python" \
+            "$PY" setup.py -q test_conformance
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: pypi-macos-${{ matrix.tag }}-${{ matrix.plat }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 6 Windows wheels: cp35 / cp36 / cp37 x win32 / win_amd64. The release ships
+  # NO cp27 and NO cp38/cp39 wheel for Windows, so there is no leg for those.
+  # The references ship CRLF .py files (descriptor_database.py = 6996 B / 177
+  # CRLF; 28 hand-written .py CRLF, 21 protoc-generated _pb2.py LF), which is the
+  # runner's default core.autocrlf=true doing its job -- it is deliberately left
+  # alone. The repo-root .gitattributes marks src/google/protobuf/testdata/** as
+  # -text so the goldens stay byte-exact for test_util.GoldenFile.
+  # All 6 reference .pyd files (_message and _api_implementation) import ONLY
+  # KERNEL32.dll + python3X.dll: the CRT is static on every leg, and the
+  # "Check the .pyd import tables" step enforces exactly that.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows ${{ matrix.tag }} ${{ matrix.plat }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # setuptools 38.5.1 (<= 38.5.2) is what writes the cp35 references'
+          # `Author:` (write_pkg_file's 'Author: %s' % get_contact(), which falls
+          # back to maintainer) and `Description-Content-Type: UNKNOWN`; 38.6.0
+          # changes PKG-INFO and 38.7.0 adds the separate `Maintainer:` field.
+          - tag: cp35
+            pyver: "3.5.4"
+            plat: win32
+            installer: python-3.5.4.exe
+            cmake_arch: Win32
+            setuptools: setuptools==38.5.1
+            wheel: wheel==0.30.0
+            vcvars_arch: "x86"
+          - tag: cp35
+            pyver: "3.5.4"
+            plat: win_amd64
+            installer: python-3.5.4-amd64.exe
+            cmake_arch: x64
+            setuptools: setuptools==38.5.1
+            wheel: wheel==0.30.0
+            vcvars_arch: "x64"
+          # The two cp36 references were built with different `wheel`s:
+          # win32 -> 0.36.2 (Metadata-Version 2.1), win_amd64 -> 0.30.0
+          # (Metadata-Version 2.0 + DESCRIPTION.rst + metadata.json), both with
+          # `Maintainer:` (setuptools >= 38.7.0).
+          - tag: cp36
+            pyver: "3.6.8"
+            plat: win32
+            installer: python-3.6.8.exe
+            cmake_arch: Win32
+            setuptools: setuptools==54.2.0
+            wheel: wheel==0.36.2
+            vcvars_arch: ""
+          - tag: cp36
+            pyver: "3.6.8"
+            plat: win_amd64
+            installer: python-3.6.8-amd64.exe
+            cmake_arch: x64
+            setuptools: setuptools==54.2.0
+            wheel: wheel==0.30.0
+            vcvars_arch: ""
+          - tag: cp37
+            pyver: "3.7.9"
+            plat: win32
+            installer: python-3.7.9.exe
+            cmake_arch: Win32
+            setuptools: setuptools==54.2.0
+            wheel: wheel==0.31.1
+            vcvars_arch: ""
+          - tag: cp37
+            pyver: "3.7.9"
+            plat: win_amd64
+            installer: python-3.7.9-amd64.exe
+            cmake_arch: x64
+            setuptools: setuptools==54.2.0
+            wheel: wheel==0.31.1
+            vcvars_arch: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install python.org CPython ${{ matrix.pyver }} (${{ matrix.plat }})
+        shell: pwsh
+        run: |
+          # actions/setup-python@v5 no longer serves 3.5, and the 32-bit legs need a
+          # genuinely 32-bit interpreter, so use the python.org web installers.
+          $url = "https://www.python.org/ftp/python/${{ matrix.pyver }}/${{ matrix.installer }}"
+          $exe = Join-Path $env:RUNNER_TEMP 'cpython-installer.exe'
+          Invoke-WebRequest -Uri $url -OutFile $exe
+          $target = 'C:\seal-python'
+          Start-Process -FilePath $exe -Wait -NoNewWindow -ArgumentList @(
+            '/quiet', 'InstallAllUsers=0', "TargetDir=$target",
+            'Include_test=0', 'Include_launcher=0', 'PrependPath=0', 'Include_pip=1')
+          & "$target\python.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$target\python.exe" -c "import struct; print(struct.calcsize('P') * 8)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "SEAL_PYTHON=$target\python.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install the build dependencies
+        shell: pwsh
+        run: |
+          # kokoro build_single_artifact.bat: `python -m pip install -U pip`.
+          # pip 20.3.4 is the newest pip that still runs on 3.5 and is on the
+          # time machine; use it on every leg.
+          & $env:SEAL_PYTHON -m pip install "pip==20.3.4"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:SEAL_PYTHON -m pip install "${{ matrix.setuptools }}" "${{ matrix.wheel }}" "six==1.15.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build libprotobuf and protoc with cmake
+        shell: pwsh
+        run: |
+          # kokoro build_single_artifact.bat flags: BUILD_SHARED_LIBS=OFF,
+          # UNICODE=ON, BUILD_TESTS=OFF. Only -A Win32|x64 is passed: naming a
+          # "Visual Studio ..." generator fails on the 2025/2026 runner images.
+          # CMAKE_POLICY_VERSION_MINIMUM is needed because cmake/CMakeLists.txt
+          # asks for 3.1.3 and cmake 4 dropped <3.5 compatibility. Every -D
+          # argument is quoted because pwsh otherwise splits on the `=`.
+          # protobuf_MSVC_STATIC_RUNTIME stays at protobuf's own default (ON,
+          # i.e. /MT) to match python/setup.py, which appends '/MT' to the
+          # extension's extra_compile_args -- an /MD libprotobuf would fail the
+          # extension link with LNK2038 RuntimeLibrary mismatch.
+          New-Item -ItemType Directory -Force -Path vcprojects | Out-Null
+          Push-Location vcprojects
+          cmake -A ${{ matrix.cmake_arch }} `
+            "-Dprotobuf_BUILD_SHARED_LIBS=OFF" `
+            "-Dprotobuf_UNICODE=ON" `
+            "-Dprotobuf_BUILD_TESTS=OFF" `
+            "-Dprotobuf_MSVC_STATIC_RUNTIME=ON" `
+            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" `
+            ..\cmake
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build . --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Stage libprotobuf and protoc where setup.py expects them
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src\.libs | Out-Null
+          $pb = Get-ChildItem -Path vcprojects -Recurse -Filter 'libprotobuf.lib' | Select-Object -First 1
+          $lite = Get-ChildItem -Path vcprojects -Recurse -Filter 'libprotobuf-lite.lib' | Select-Object -First 1
+          $protoc = Get-ChildItem -Path vcprojects -Recurse -Filter 'protoc.exe' | Select-Object -First 1
+          if (-not $pb -or -not $lite -or -not $protoc) {
+            Get-ChildItem -Path vcprojects -Recurse -Include '*.lib', '*.exe' | Select-Object -ExpandProperty FullName
+            throw 'cmake outputs not found'
+          }
+          Copy-Item $pb.FullName   src\.libs\libprotobuf.a
+          Copy-Item $pb.FullName   src\.libs\protobuf.lib
+          Copy-Item $lite.FullName src\.libs\libprotobuf-lite.a
+          Get-ChildItem src\.libs
+          $protoc.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # setuptools 38.5.1 (the pin the 2 cp35 references need for `Author:`)
+      # first defers to distutils' own vcvarsall/registry probe, which predates
+      # vswhere and on 3.5 cannot see Visual Studio on the 2026 image ("Microsoft
+      # Visual C++ 14.0 is required"). Put the toolchain in the ambient
+      # environment and set DISTUTILS_USE_SDK (build step), which makes
+      # distutils._msvccompiler._get_vc_env use that env instead.
+      - name: Put MSVC in the environment (cp35 only)
+        if: matrix.vcvars_arch != ''
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.vcvars_arch }}
+
+      # Whether the CRT ends up static or dynamic is decided by whether
+      # distutils._msvccompiler sees a redistributable vcruntime140.dll
+      # (env["py_vcruntime_redist"]). With one it compiles /MD and leaves ldflags
+      # alone, so setup.py's trailing '/MT' wins and the CRT is STATIC -- what
+      # all 6 references show. With none (3.5/3.6 stdlib) it also appends
+      # '/nodefaultlib:libucrt.lib ucrt.lib', making the UCRT a dynamic import
+      # (six api-ms-win-crt-*.dll) that no /MT can undo.
+      #   cp35 (setuptools 38.5.1): msvc14_get_vc_env defers to distutils'
+      #     _get_vc_env, which under DISTUTILS_USE_SDK reports no redist -> force
+      #     one with the sitecustomize shim below (as the verified 3.12.4 build
+      #     did with 38.6.1, same code path). No DLL gets bundled:
+      #     _copy_vcruntime's os.path.isfile guard rejects the bare filename.
+      #   cp36 (setuptools 54.2.0): setuptools replaces _get_vc_env with its own
+      #     CPython-3.8 backport, which globs Microsoft.VC14*.CRT and finds the
+      #     redist on this image -> static with no intervention.
+      #   cp37 (3.7.9): bpo-38597 removed the redist probe and the ucrt swap from
+      #     distutils, so setup.py's '/MT' always wins -> static.
+      - name: Force a found vcruntime redist (cp35)
+        if: matrix.tag == 'cp35'
+        shell: pwsh
+        run: |
+          $shim = Join-Path $env:RUNNER_TEMP 'ucrtshim'
+          New-Item -ItemType Directory -Force -Path $shim | Out-Null
+          @'
+          import distutils._msvccompiler as _mc
+
+          _orig_get_vc_env = _mc._get_vc_env
+
+
+          def _get_vc_env(plat_spec):
+              env = _orig_get_vc_env(plat_spec)
+              env["py_vcruntime_redist"] = "vcruntime140.dll"
+              return env
+
+
+          _mc._get_vc_env = _get_vc_env
+          '@ -split "`r?`n" |
+            ForEach-Object { $_ -replace '^          ', '' } |
+            Set-Content -Path (Join-Path $shim 'sitecustomize.py') -Encoding utf8
+          "PYTHONPATH=$shim" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build the ${{ matrix.plat }} wheel
+        shell: pwsh
+        run: |
+          # Only the cp35 legs get DISTUTILS_USE_SDK, and only because the step
+          # above put a full MSVC env in place for them. Setting it to "" on the
+          # other legs is NOT a no-op -- os.getenv() sees an empty string as set.
+          if ("${{ matrix.vcvars_arch }}" -ne "") { $env:DISTUTILS_USE_SDK = "1" }
+          protoc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location python
+          # --warnings_as_errors is deliberately omitted: MSVC does not take the
+          # -Werror that flag appends.
+          & $env:SEAL_PYTHON setup.py bdist_wheel --cpp_implementation --compile_static_extension
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      - name: Check the .pyd import tables (static CRT, as in the references)
+        shell: pwsh
+        run: |
+          # Reads every .pyd's PE import directory with the stdlib only and
+          # fails if anything beyond KERNEL32.dll + python3X.dll is imported.
+          @'
+          import glob, struct, sys, zipfile
+
+          def imports(d):
+              pe = struct.unpack_from("<I", d, 0x3C)[0]
+              nsec = struct.unpack_from("<H", d, pe + 6)[0]
+              optsz = struct.unpack_from("<H", d, pe + 20)[0]
+              opt = pe + 24
+              dd = opt + (96 if struct.unpack_from("<H", d, opt)[0] == 0x10B else 112)
+              rva = struct.unpack_from("<I", d, dd + 8)[0]
+              secs = [struct.unpack_from("<IIII", d, pe + 24 + optsz + 40 * i + 8)
+                      for i in range(nsec)]
+              def off(r):
+                  for vsz, va, rsz, ptr in secs:
+                      if va <= r < va + max(vsz, rsz):
+                          return r - va + ptr
+                  raise ValueError(r)
+              out, p = [], off(rva)
+              while True:
+                  name = struct.unpack_from("<I", d, p + 12)[0]
+                  if not name:
+                      return out
+                  o = off(name)
+                  out.append(d[o:d.index(b"\0", o)].decode())
+                  p += 20
+
+          bad = False
+          for whl in glob.glob("python/dist/*.whl"):
+              z = zipfile.ZipFile(whl)
+              for n in z.namelist():
+                  if n.endswith(".pyd"):
+                      dlls = imports(z.read(n))
+                      print(n, dlls)
+                      extra = [x for x in dlls if x.lower() != "kernel32.dll"
+                               and not x.lower().startswith("python3")]
+                      if extra:
+                          print("  unexpected imports:", extra)
+                          bad = True
+                  elif n.lower().endswith(".dll"):
+                      print("  unexpected DLL in wheel:", n)
+                      bad = True
+          sys.exit(1 if bad else 0)
+          '@ | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'pyd_imports.py') -Encoding utf8
+          # The runner's own python (no distutils) must not load the cp35 shim.
+          $env:PYTHONPATH = ''
+          python (Join-Path $env:RUNNER_TEMP 'pyd_imports.py')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Import the extension from the built wheel (kokoro run_tests)
+        shell: pwsh
+        run: |
+          $whl = (Get-ChildItem python\dist\*.whl | Select-Object -First 1).FullName
+          $t = Join-Path $env:RUNNER_TEMP 'wheeltest'
+          & $env:SEAL_PYTHON -m pip install --no-deps --target $t $whl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location $env:RUNNER_TEMP
+          $env:PYTHONPATH = $t
+          & $env:SEAL_PYTHON -c "from google.protobuf.pyext import _message; print(_message.__file__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      # tox.ini's python env also runs `setup.py test_conformance`, which is
+      # `make test_python` in ../conformance: an autotools target whose runner
+      # (conformance_test_runner.cc) drives the testee with fork()/execv(). It
+      # cannot run on Windows, so it runs on the Linux and macOS legs only.
+      - name: Run the project's test suite (python/tox.ini py*-python)
+        shell: pwsh
+        env:
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+        run: |
+          Set-Location python
+          & $env:SEAL_PYTHON setup.py -q build_py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:SEAL_PYTHON setup.py -q build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $filter = '${{ inputs.test-filter }}'
+          if ($filter) {
+            & $env:SEAL_PYTHON setup.py -q test -q --test-suite=$filter
+          } else {
+            & $env:SEAL_PYTHON setup.py -q test -q
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: pypi-windows-${{ matrix.tag }}-${{ matrix.plat }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # protobuf-3.15.8-py2.py3-none-any.whl + protobuf-3.15.8.tar.gz.
+  # python/setup.cfg sets [bdist_wheel] universal = 1, so a plain bdist_wheel
+  # (no --cpp_implementation) is the py2.py3-none-any wheel.
+  # The commands are python/release.sh's own publish sequence. Both dists still
+  # need protoc: build_py generates the well-known-type *_pb2.py they carry.
+  # Their Generator (0.34.2) and PKG-INFO (Metadata-Version 1.2) match Ubuntu
+  # 20.04's python3-wheel 0.34.2 / python3-setuptools 45.2.0 on Python 3.8.
+  # ---------------------------------------------------------------------------
+  sdist-and-pure-wheel:
+    name: sdist + pure wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Build protoc
+        run: |
+          set -ex
+          ./autogen.sh
+          CXXFLAGS="-fPIC -g -O2" ./configure
+          make -j"$(nproc)"
+          ./src/protoc --version
+
+      - name: Install the build dependencies
+        run: python -m pip install "setuptools==45.2.0" "wheel==0.34.2" "six==1.15.0"
+
+      - name: Run the project's test suite (python/tox.ini py38-python)
+        env:
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+        run: |
+          set -ex
+          cd python
+          python setup.py -q build_py
+          python setup.py -q build
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            python setup.py -q test -q --test-suite="${{ inputs.test-filter }}"
+          else
+            python setup.py -q test -q
+          fi
+          PYTHONPATH="$GITHUB_WORKSPACE/python" python setup.py -q test_conformance
+
+      - name: Build the sdist and the pure wheel
+        run: |
+          set -ex
+          cd python
+          # python/release.sh runs under umask 0022; the reference sdist stores
+          # setup.py as 0754 (rwxr-xr--), not the 0755 a checkout gives.
+          umask 0022
+          chmod 754 setup.py
+          # python/release.sh: build before sdist so the well-known types are in,
+          # and clean before bdist_wheel so no .so from a --cpp_implementation
+          # build can leak into the pure wheel.
+          python setup.py clean build sdist
+          python setup.py clean build bdist_wheel
+          ls -l dist
+
+      - name: Rename the pure wheel's nspkg .pth to the published name
+        run: |
+          # Every platform wheel has protobuf-3.15.8-pyX.Y-nspkg.pth, but the
+          # published pure wheel has protobuf-3.15.8-nspkg.pth (Debian's patched
+          # setuptools drops the -pyX.Y egg suffix) while upstream setuptools
+          # always appends it. Rename that one archive member (content unchanged)
+          # and repoint the RECORD line at it.
+          python - <<'PY'
+          import glob, os, zipfile
+
+          whl = glob.glob("python/dist/protobuf-3.15.8-py2.py3-none-any.whl")[0]
+          zin = zipfile.ZipFile(whl)
+          names = zin.namelist()
+          old = next((n for n in names if n.endswith("-nspkg.pth")), None)
+          new = "protobuf-3.15.8-nspkg.pth"
+          if old is None or old == new:
+              print("nspkg .pth already named", old)
+              zin.close()
+              raise SystemExit(0)
+          record = next(n for n in names if n.endswith(".dist-info/RECORD"))
+          data = {n: zin.read(n) for n in names}
+          infos = {n: zin.getinfo(n) for n in names}
+          zin.close()
+          data[record] = data[record].replace(old.encode() + b",", new.encode() + b",")
+          tmp = whl + ".tmp"
+          with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+              for n in names:
+                  src = infos[n]
+                  zi = zipfile.ZipInfo(new if n == old else n, date_time=src.date_time)
+                  zi.compress_type = src.compress_type
+                  zi.external_attr = src.external_attr
+                  zi.create_system = src.create_system
+                  zout.writestr(zi, data[n])
+          os.replace(tmp, whl)
+          print("renamed", old, "->", new)
+          PY
+          python -c "import zipfile; print('\n'.join(sorted(n for n in zipfile.ZipFile('python/dist/protobuf-3.15.8-py2.py3-none-any.whl').namelist() if 'dist-info' in n or n.endswith('.pth'))))"
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: pypi-sdist-and-pure-wheel
+          path: |
+            python/dist/protobuf-3.15.8.tar.gz
+            python/dist/protobuf-3.15.8-py2.py3-none-any.whl
+          if-no-files-found: error
