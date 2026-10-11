@@ -410,7 +410,11 @@ def _CreateMessageFromTypeUrl(type_url, descriptor_pool):
   return message_class()
 
 
-def Parse(text, message, ignore_unknown_fields=False, descriptor_pool=None):
+def Parse(text,
+          message,
+          ignore_unknown_fields=False,
+          descriptor_pool=None,
+          max_recursion_depth=100):
   """Parses a JSON representation of a protocol message into a message.
 
   Args:
@@ -419,6 +423,9 @@ def Parse(text, message, ignore_unknown_fields=False, descriptor_pool=None):
     ignore_unknown_fields: If True, do not raise errors for unknown fields.
     descriptor_pool: A Descriptor Pool for resolving types. If None use the
         default.
+    max_recursion_depth: max recursion depth of JSON message to be
+        deserialized. JSON messages over this depth will fail to be
+        deserialized. Default value is 100.
 
   Returns:
     The same message passed as argument.
@@ -431,13 +438,15 @@ def Parse(text, message, ignore_unknown_fields=False, descriptor_pool=None):
     js = json.loads(text, object_pairs_hook=_DuplicateChecker)
   except ValueError as e:
     raise ParseError('Failed to load JSON: {0}.'.format(str(e)))
-  return ParseDict(js, message, ignore_unknown_fields, descriptor_pool)
+  return ParseDict(js, message, ignore_unknown_fields, descriptor_pool,
+                   max_recursion_depth)
 
 
 def ParseDict(js_dict,
               message,
               ignore_unknown_fields=False,
-              descriptor_pool=None):
+              descriptor_pool=None,
+              max_recursion_depth=100):
   """Parses a JSON dictionary representation into a message.
 
   Args:
@@ -446,11 +455,14 @@ def ParseDict(js_dict,
     ignore_unknown_fields: If True, do not raise errors for unknown fields.
     descriptor_pool: A Descriptor Pool for resolving types. If None use the
       default.
+    max_recursion_depth: max recursion depth of JSON message to be
+      deserialized. JSON messages over this depth will fail to be deserialized.
+      Default value is 100.
 
   Returns:
     The same message passed as argument.
   """
-  parser = _Parser(ignore_unknown_fields, descriptor_pool)
+  parser = _Parser(ignore_unknown_fields, descriptor_pool, max_recursion_depth)
   parser.ConvertMessage(js_dict, message)
   return message
 
@@ -461,9 +473,12 @@ _INT_OR_FLOAT = six.integer_types + (float,)
 class _Parser(object):
   """JSON format parser for protocol message."""
 
-  def __init__(self, ignore_unknown_fields, descriptor_pool):
+  def __init__(self, ignore_unknown_fields, descriptor_pool,
+               max_recursion_depth=100):
     self.ignore_unknown_fields = ignore_unknown_fields
     self.descriptor_pool = descriptor_pool
+    self.max_recursion_depth = max_recursion_depth
+    self.recursion_depth = 0
 
   def ConvertMessage(self, value, message):
     """Convert a JSON object into a message.
@@ -475,6 +490,10 @@ class _Parser(object):
     Raises:
       ParseError: In case of convert problems.
     """
+    self.recursion_depth += 1
+    if self.recursion_depth > self.max_recursion_depth:
+      raise ParseError('Message too deep. Max recursion depth is {0}'.format(
+          self.max_recursion_depth))
     message_descriptor = message.DESCRIPTOR
     full_name = message_descriptor.full_name
     if _IsWrapperMessage(message_descriptor):
@@ -483,6 +502,7 @@ class _Parser(object):
       methodcaller(_WKTJSONMETHODS[full_name][1], value, message)(self)
     else:
       self._ConvertFieldValuePair(value, message)
+    self.recursion_depth -= 1
 
   def _ConvertFieldValuePair(self, js, message):
     """Convert field value pairs into regular message.
@@ -617,8 +637,9 @@ class _Parser(object):
     if _IsWrapperMessage(message_descriptor):
       self._ConvertWrapperMessage(value['value'], sub_message)
     elif full_name in _WKTJSONMETHODS:
-      methodcaller(
-          _WKTJSONMETHODS[full_name][1], value['value'], sub_message)(self)
+      # For well-known types (including nested Any), use ConvertMessage
+      # to ensure recursion depth is properly tracked
+      self.ConvertMessage(value['value'], sub_message)
     else:
       del value['@type']
       self._ConvertFieldValuePair(value, sub_message)
@@ -639,9 +660,9 @@ class _Parser(object):
   def _ConvertValueMessage(self, value, message):
     """Convert a JSON representation into Value message."""
     if isinstance(value, dict):
-      self._ConvertStructMessage(value, message.struct_value)
+      self.ConvertMessage(value, message.struct_value)
     elif isinstance(value, list):
-      self. _ConvertListValueMessage(value, message.list_value)
+      self.ConvertMessage(value, message.list_value)
     elif value is None:
       message.null_value = 0
     elif isinstance(value, bool):
@@ -661,7 +682,7 @@ class _Parser(object):
           'ListValue must be in [] which is {0}.'.format(value))
     message.ClearField('values')
     for item in value:
-      self._ConvertValueMessage(item, message.values.add())
+      self.ConvertMessage(item, message.values.add())
 
   def _ConvertStructMessage(self, value, message):
     """Convert a JSON representation into Struct message."""
@@ -672,7 +693,7 @@ class _Parser(object):
     # there are no values.
     message.Clear()
     for key in value:
-      self._ConvertValueMessage(value[key], message.fields[key])
+      self.ConvertMessage(value[key], message.fields[key])
     return
 
   def _ConvertWrapperMessage(self, value, message):
